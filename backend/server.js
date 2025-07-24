@@ -189,7 +189,11 @@ async function startChatWorker(io) {
 startChatWorker(io);
 
 // 서버 시작
-mongoose.connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI, {
+  maxPoolSize: 50,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000
+})
   .then(() => {
     console.log('MongoDB Connected');
     server.listen(PORT, '0.0.0.0', () => {
