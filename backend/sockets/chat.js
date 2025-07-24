@@ -61,7 +61,6 @@ function setSocketIO(io) {
     // 채팅방 입장
     socket.on('joinRoom', async (roomId) => {
       const room = await Room.findById(roomId).populate('participants', 'name profileImage');
-      console.log('participantsUpdate:', room && room.participants);
       if (!room || !room.participants.some(p => String(p._id) === userId)) {
         return socket.emit('joinRoomError', { message: '입장 권한 없음' });
       }
