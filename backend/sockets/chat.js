@@ -30,7 +30,7 @@ function setSocketIO(io) {
   const BATCH_SIZE = 30;  // 한 번에 로드할 메시지 수
   const LOAD_DELAY = 300; // 메시지 로드 딜레이 (ms)
   const MAX_RETRIES = 3;  // 최대 재시도 횟수
-  const MESSAGE_LOAD_TIMEOUT = 10000; // 메시지 로드 타임아웃 (10초)
+  const MESSAGE_LOAD_TIMEOUT = 20000; // 메시지 로드 타임아웃 (20초)
   const RETRY_DELAY = 2000; // 재시도 간격 (2초)
   const DUPLICATE_LOGIN_TIMEOUT = 10000; // 중복 로그인 타임아웃 (10초)
 
@@ -44,21 +44,71 @@ function setSocketIO(io) {
 
   // 메시지 일괄 로드 함수 개선
   const loadMessages = async (socket, roomId, before, limit = BATCH_SIZE) => {
-    const timeoutPromise = new Promise((_, reject) => {
+    const timeoutPromise = new Promise((resolve) => {
       setTimeout(() => {
-        reject(new Error('Message loading timed out'));
+        resolve({ timeout: true });
       }, MESSAGE_LOAD_TIMEOUT);
     });
 
     try {
-      // 쿼리 구성
+      // Redis 리스트 캐시 우선 조회
+      const redisKey = `chat:room:${roomId}:messages`;
+      let cachedMessages = [];
+      try {
+        cachedMessages = await redisClient.lRange(redisKey, 0, limit + 1);
+      } catch (err) {
+        console.error('[Redis] lRange error:', err);
+        cachedMessages = [];
+      }
+      let messages = [];
+      if (cachedMessages && cachedMessages.length > 0) {
+        messages = cachedMessages.map(msg => {
+          try { return JSON.parse(msg); } catch { return null; }
+        }).filter(Boolean);
+      }
+      // before 파라미터가 있으면 필터링
+      if (before) {
+        messages = messages.filter(msg => new Date(msg.timestamp) < new Date(before));
+      }
+      // 최신순 정렬 후 limit 적용
+      messages = messages.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+      const hasMore = messages.length > limit;
+      const resultMessages = messages.slice(0, limit);
+      const sortedMessages = resultMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+      // 캐시 hit 시 바로 반환
+      if (sortedMessages.length > 0) {
+        // 읽음 상태 비동기 업데이트
+        if (socket.user) {
+          const messageIds = sortedMessages.map(msg => msg._id);
+          Message.updateMany(
+            {
+              _id: { $in: messageIds },
+              'readers.userId': { $ne: socket.user.id }
+            },
+            {
+              $push: {
+                readers: {
+                  userId: socket.user.id,
+                  readAt: new Date()
+                }
+              }
+            }
+          ).exec().catch(error => {
+            console.error('Read status update error:', error);
+          });
+        }
+        return {
+          messages: sortedMessages,
+          hasMore,
+          oldestTimestamp: sortedMessages[0]?.timestamp || null
+        };
+      }
+      // 캐시 miss 시 DB 조회
       const query = { room: roomId };
       if (before) {
         query.timestamp = { $lt: new Date(before) };
       }
-
-      // 메시지 로드 with profileImage
-      const messages = await Promise.race([
+      const raceResult = await Promise.race([
         Message.find(query)
           .populate('sender', 'name email profileImage')
           .populate({
@@ -70,17 +120,32 @@ function setSocketIO(io) {
           .lean(),
         timeoutPromise
       ]);
-
-      // 결과 처리
-      const hasMore = messages.length > limit;
-      const resultMessages = messages.slice(0, limit);
-      const sortedMessages = resultMessages.sort((a, b) => 
-        new Date(a.timestamp) - new Date(b.timestamp)
-      );
-
+      if (raceResult && raceResult.timeout) {
+        logDebug('message load timeout', { roomId, before, limit });
+        return {
+          messages: [],
+          hasMore: false,
+          oldestTimestamp: null,
+          error: 'Message loading timed out'
+        };
+      }
+      let messagesDB = raceResult;
+      // DB 결과를 Redis에 캐싱 (limit+1개만)
+      if (messagesDB && messagesDB.length > 0) {
+        try {
+          await redisClient.del(redisKey);
+          await redisClient.lPush(redisKey, ...messagesDB.map(msg => JSON.stringify(msg)));
+          await redisClient.lTrim(redisKey, 0, 99);
+        } catch (err) {
+          console.error('[Redis] 캐싱 error:', err);
+        }
+      }
+      const hasMoreDB = messagesDB.length > limit;
+      const resultMessagesDB = messagesDB.slice(0, limit);
+      const sortedMessagesDB = resultMessagesDB.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
       // 읽음 상태 비동기 업데이트
-      if (sortedMessages.length > 0 && socket.user) {
-        const messageIds = sortedMessages.map(msg => msg._id);
+      if (sortedMessagesDB.length > 0 && socket.user) {
+        const messageIds = sortedMessagesDB.map(msg => msg._id);
         Message.updateMany(
           {
             _id: { $in: messageIds },
@@ -98,29 +163,25 @@ function setSocketIO(io) {
           console.error('Read status update error:', error);
         });
       }
-
       return {
-        messages: sortedMessages,
-        hasMore,
-        oldestTimestamp: sortedMessages[0]?.timestamp || null
+        messages: sortedMessagesDB,
+        hasMore: hasMoreDB,
+        oldestTimestamp: sortedMessagesDB[0]?.timestamp || null
       };
     } catch (error) {
-      if (error.message === 'Message loading timed out') {
-        logDebug('message load timeout', {
-          roomId,
-          before,
-          limit
-        });
-      } else {
-        console.error('Load messages error:', {
-          error: error.message,
-          stack: error.stack,
-          roomId,
-          before,
-          limit
-        });
-      }
-      throw error;
+      console.error('Load messages error:', {
+        error: error.message,
+        stack: error.stack,
+        roomId,
+        before,
+        limit
+      });
+      return {
+        messages: [],
+        hasMore: false,
+        oldestTimestamp: null,
+        error: error.message
+      };
     }
   };
 
@@ -325,6 +386,14 @@ function setSocketIO(io) {
 
         const result = await loadMessagesWithRetry(socket, roomId, before);
         
+        if (result.error) {
+          socket.emit('error', {
+            type: 'LOAD_ERROR',
+            message: result.error
+          });
+          return;
+        }
+
         logDebug('previous messages loaded', {
           roomId,
           messageCount: result.messages.length,

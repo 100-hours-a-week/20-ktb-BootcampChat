@@ -279,6 +279,21 @@ class RedisClient {
     }
     return await this.client.lTrim(key, start, stop);
   }
+
+  async lRange(key, start, stop) {
+    if (!this.isConnected) {
+      await this.connect();
+    }
+    if (this.useMock) {
+      let arr = [];
+      const item = this.client.store.get(key);
+      if (item) {
+        try { arr = JSON.parse(item.value); } catch { arr = []; }
+      }
+      return arr.slice(start, stop + 1);
+    }
+    return await this.client.lRange(key, start, stop);
+  }
 }
 
 const redisClient = new RedisClient();
